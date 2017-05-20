@@ -1,0 +1,7 @@
+/usr/src/astronomy/joslufocus/build/CMakeFiles/rebuild_cache.dir
+/usr/src/astronomy/joslufocus/build/CMakeFiles/list_install_components.dir
+/usr/src/astronomy/joslufocus/build/CMakeFiles/install.dir
+/usr/src/astronomy/joslufocus/build/CMakeFiles/install/local.dir
+/usr/src/astronomy/joslufocus/build/CMakeFiles/install/strip.dir
+/usr/src/astronomy/joslufocus/build/CMakeFiles/edit_cache.dir
+/usr/src/astronomy/joslufocus/build/CMakeFiles/indi_joslufocus.dir
