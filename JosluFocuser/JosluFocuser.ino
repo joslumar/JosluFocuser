@@ -6,7 +6,7 @@
  * 
  * Pending: new GPL parser & ASCOM driver robocofus independent
  * 
- * Robofocus parser cmd based in NandofocusV8
+ * A special thanks to the published work of nando (nandofocus8), which greatly facilitated the start of this project
  * Site: http://es.groups.yahoo.com/group/nandofocus_group/
  * License: http://creativecommons.org/licenses/by-sa/3.0/deed.es
  * 
@@ -14,15 +14,13 @@
  * 
  * 
  * # robofocus CMDs:
- * F{C}{N}{VVVVV}
- * C orden
- * N valor1/dir/0 (1 byte)
- * V valor2/posicion (5 bytes)
- * 1 <= motorPos <= posicion <= 65536
+ * F{C}{VVVVVVV}
+ * C command
+ * V argument/value (6 bytes)
  * 
  * FV000000#
  * FP000000#
- * FC000000#            
+ * FC000000#
  * FT000000#
  * FS000000#
  * FS010000#
@@ -34,7 +32,13 @@
  * FO000100#
  * FI002000#
  * FO002000#
+ * FD000000#
+ * FR000000#
  * FM500500#
+ * FM000000#
+ *
+ * No robocofus:
+ * FM500500#   // microsteps + motor loop timming
  * 
  * 
  * // sodeco-saia -> 120 pasos / rev => pasos de 3º
@@ -42,8 +46,7 @@
  **************************************************************************/
 
 
-#define _FOCUSER_DEBUG
-
+//#define _FOCUSER_DEBUG
 #ifdef _FOCUSER_DEBUG
 #define _FOCUSER_MOTOR_DEBUG
 //#define _FOCUSER_MOTOR_LOOP_DEBUG
@@ -52,12 +55,12 @@
 
 #include <Arduino.h>
 #include <EEPROM.h>
-#include <TimerOne.h> // Ojo, que me cargo las salidas PWM 9 y 10 // http://playground.arduino.cc/Code/Timer1
+#include <TimerOne.h> // Warning!! this disables the PWM 9 and 10 outputs // http://playground.arduino.cc/Code/Timer1
 #include <DHT.h>      // http://playground.arduino.cc/Main/DHTLib
-#include "Focuser.h"
+#include "JosluFocuser.h"
 
 #define VERSION "13"
-#define ROBOFOCUS_VERSION "000111" //dont change
+#define ROBOFOCUS_VERSION "000111" //don't change
 
 //#define DHT_TYPE DHT22   // AM2302
 #define DHT_TYPE AM2301    // DHT21, AM2301
@@ -80,14 +83,16 @@
 // 13 -> PC7 PWM 10 bit    OC4A         timer4
 // 12 -> PD6 PWM Hi (?)    !OC4D                    !D timer4 opt?
 //
-// timer 2 no existe en el 32u4
-// timer 0 -> usado en millis
+// timer 2 don't exist in the 32u4 controller
+// timer 0 -> this is used by millis() function
 
 #define PIN_BOBINA_1A  5 // timer 3
 #define PIN_BOBINA_1B  6 // timer 4
 #define PIN_BOBINA_2A 11 // timer 0
 #define PIN_BOBINA_2B 13 // timer 4
 
+// For PWM every motor step, pwm period coil control must be mucho smaller than interrupt motor loop timer
+// then I must play with avr (32u4) timiers internals
 /*PWM SETUP
  timers 0,1 & 3:
  Setting    Divisor    Frequency [Hz](phase-correct mode)
@@ -115,11 +120,11 @@
 
 #define millis() ( ( millis() << 1 ) / TIMERSPRESCALER )
 
+// microsteps table
 // octave:
 // n=128; A=[round(sin([0:n/2-1]*pi/n*2)*255), zeros(1,n/2)]; A
 // MS=16 ; B=[]; for i = 0:MS-1 ; B=[B A(i*n/MS+1)] ; endfor ; 
 #define MAXMICROSTEPS 32 // son 128 micropasos / ciclo
-
 volatile const byte pwmStepsTable[MAXMICROSTEPS<<1]={
   0,  13,  25,  37,  50,  62,  74,  86,
   98, 109, 120, 131, 142, 152, 162, 171,
@@ -164,7 +169,7 @@ struct EEpromStore{
 
 EEpromStore mieeprom;
 EEpromStore reset = {
-  CONFIG_VERSION, 1, 0, 30000, '2', 32, 65000, 0, 16, 500, 0, 0, 0, 0, 0, 0 };
+  CONFIG_VERSION, 1, 0, 20000, '2', 0, 65000, 0, 0, 0, 0, 16, 500, 0, 0, 0, 0, 0, 0 };
 
 DHT dht(DHT_PIN, DHT_TYPE);
 
@@ -189,10 +194,10 @@ volatile boolean interrupting_t1 = false;
 volatile byte motion_speed  = 4;   // 2, 4, 8
 volatile boolean priomotion = false;   // motor a toda leche
 
-int tick;
-int compensa_backslash = 0;
-unsigned int targetPos = 30000;
-unsigned int diff = 0;
+volatile int compensa_backslash = 0;
+volatile unsigned int targetPos = 30000;
+
+volatile int relax_ticks = 0;
 
 volatile short int step = 0;   // 0 .. ULTIMOPASO
 volatile unsigned int motorPos = 30000;
@@ -205,27 +210,25 @@ volatile int delay_tick;  // tiempo muerto mientras espera el siguiente slot tic
 volatile unsigned long timer1Period=500; // 1000us step size (a 250us pierde par)
 volatile unsigned int microSteps=16;    // 1 2 4 8 16 32 micropasos/paso => 4 8 16 32 64 128 micropasos / ciclo ; 1 ciclo = 4 pasos enteros
 
-int relax_ticks = 0;
-
 
 volatile float temperature = NAN;
 volatile float humidity = NAN;
-double dewPointValue = NAN;
+volatile float dewPointValue = NAN;
 
 // for inputs
 volatile int    lastSensorATemp_Value,lastSensorBTemp_Value,lastSensorCTemp_Value;
-volatile double lastSensorATemp,lastSensorBTemp,lastSensorCTemp;
+volatile float lastSensorATemp,lastSensorBTemp,lastSensorCTemp;
 
 // for filters
 int    xSensorATempValues[4],xSensorBTempValues[4],xSensorCTempValues[4];
 
 volatile boolean loop_halfsecond_ready = true;
 
-// for soft PWM
-volatile unsigned int pwmCounter = 0; // (0..100)
+// for soft PWM (heaters)
+volatile unsigned int pwmHeatersCounter = 0; // (0..64)
 
-// soft pwm heaters (0..100)
-volatile int heaterA, heaterB, heaterC  = 0; // value < 0 => OFF  -100 .. 100
+// soft pwm heaters (0..64)
+volatile int heaterA, heaterB, heaterC  = 0; // value < 0 => OFF  -64 .. 64
 
 volatile byte sw1, sw2, sw3, sw4;
 
@@ -234,37 +237,38 @@ char response_str[10]={
 
 char tmp_str[256]; // resulting string limited to 256 chars
 
-
+/*
 // http://playground.arduino.cc/Main/DHT11Lib
-// dewPoint function NOAA
-// reference (1) : http://wahiduddin.net/calc/density_algorithms.htm
-// reference (2) : http://www.colorado.edu/geography/weather_station/Geog_site/about.htm
-//
-double dewPoint(double celsius, double humidity)
-{
-  // (1) Saturation Vapor Pressure = ESGG(T)
-  double RATIO = 373.15 / (273.15 + celsius);
-  double RHS = -7.90298 * (RATIO - 1);
-  RHS += 5.02808 * log10(RATIO);
-  RHS += -1.3816e-7 * (pow(10, (11.344 * (1 - 1/RATIO ))) - 1) ;
-  RHS += 8.1328e-3 * (pow(10, (-3.49149 * (RATIO - 1))) - 1) ;
-  RHS += log10(1013.246);
-
-  // factor -3 is to adjust units - Vapor Pressure SVP * humidity
-  double VP = pow(10, RHS - 3) * humidity;
-
-  // (2) DEWPOINT = F(Vapor Pressure)
-  double T = log(VP/0.61078);   // temp var
-  return (241.88 * T) / (17.558 - T);
-}
+ // dewPoint function NOAA
+ // reference (1) : http://wahiduddin.net/calc/density_algorithms.htm
+ // reference (2) : http://www.colorado.edu/geography/weather_station/Geog_site/about.htm
+ //
+ float dewPoint(float celsius, float humidity)
+ {
+ // (1) Saturation Vapor Pressure = ESGG(T)
+ double RATIO = 373.15 / (273.15 + celsius);
+ double RHS = -7.90298 * (RATIO - 1);
+ RHS += 5.02808 * log10(RATIO);
+ RHS += -1.3816e-7 * (pow(10, (11.344 * (1 - 1/RATIO ))) - 1) ;
+ RHS += 8.1328e-3 * (pow(10, (-3.49149 * (RATIO - 1))) - 1) ;
+ RHS += log10(1013.246);
+ 
+ // factor -3 is to adjust units - Vapor Pressure SVP * humidity
+ double VP = pow(10, RHS - 3) * humidity;
+ 
+ // (2) DEWPOINT = F(Vapor Pressure)
+ double T = log(VP/0.61078);   // temp var
+ return (241.88 * T) / (17.558 - T);
+ }
+ */
 
 // delta max = 0.6544 wrt dewPoint()
 // 6.9 x faster than dewPoint()
 // reference: http://en.wikipedia.org/wiki/Dew_point
 double dewPointFast(double celsius, double humidity)
 {
-  double a = 17.271;
-  double b = 237.7;
+  const double a = 17.271;
+  const double b = 237.7;
   double temp = (a * celsius) / (b + celsius) + log(humidity*0.01);
   double Td = (b * temp) / (a - temp);
   return Td;
@@ -288,10 +292,10 @@ int medianFilter (int xValues[], int value) {
 }
 
 // redondeo al decimal. MODELAR !!!!!
-double TempNTC(int RawADC) { // HOT
-  static double b = 790.06;
-  static double m = 5.06;
-  return (int)( ((RawADC-b) / m )*10 ) / 10.0; // celsius
+float TempNTC(int RawADC) { // HOT
+  const static double b = 790.06;
+  const static double m = 5.06;
+  return (int)( ((RawADC - b) / m ) * 10 ) / 10.0; // celsius
   // 826 -> 7.1
   // 908 -> 23.3
 }
@@ -325,7 +329,7 @@ void writeEE()
   byte *v;
   v = (byte *) &mieeprom;
   for (unsigned int i=0; i < sizeof(mieeprom);i++,v++) {
-    if( EEPROM.read(i) != *v )
+    if( EEPROM.read(i) != *v ) // to save eeprom life
       EEPROM.write(i, *v);
     //EEPROM.update(i,*v);
   }
@@ -352,20 +356,23 @@ void saveEEStatus()
 
 void resetFocuser()
 {
-  int i;
   memcpy(&mieeprom,&reset,sizeof(mieeprom));
   writeEE();
-  for( i = 0; i<10; i++ )
+  loadEEStatus();
+  cancelAndStopFocuser();
+  Timer1.setPeriod(timer1Period);
+  for( int i = 0; i<10; i++ )
   {
     digitalWrite(PIN_LED, HIGH);   // turn the LED on (HIGH is the voltage level)
-    delay(20);               // wait for a 1/20 second
+    delay(20);                     // wait for a 1/20 second
     digitalWrite(PIN_LED, LOW);    // turn the LED off by making the voltage LOW
-    delay(20);               // wait for a 1/20 second
+    delay(20);                     // wait for a 1/20 second
   }
+  //asm volatile ("  jmp 0"); // software reset. Don't reset devices
 }
 
 
-void relaja_motor()
+void motorRelax()
 {
   digitalWrite(PIN_BOBINA_1A, LOW);
   digitalWrite(PIN_BOBINA_1B, LOW);  
@@ -461,15 +468,14 @@ void doMotorStep8(int step)
   }
 }
 
+// devuelve el valor de la potencia de pulso para la posicion del micropaso absoluto pos
 int getpwmbyStep(int pos) {
-  // devuelve el valor del ancho de pulso para la posicion del micropaso absoluto pos
 
-    pos = pos % (microSteps<<2); // microSteps => 1 cuadrante => x4
+  pos = pos % (microSteps<<2); // microSteps => 1 cuadrante => x4
   if (pos == 0)
     pos = microSteps<<2;
 
   unsigned int index = ((pos - 1) * MAXMICROSTEPS) / microSteps;
-
   return ( index < (MAXMICROSTEPS<<1) ? pwmStepsTable[index] : 0 );  // solo tengo medio cuadrante en el array, el resto es cero
 }
 
@@ -486,7 +492,6 @@ void doMotorStep(int step)
     getpwmbyStep(step),getpwmbyStep(step+(microSteps<<1)), getpwmbyStep(step+microSteps), getpwmbyStep(step+microSteps*3));
     Serial.print(tmp_str);
 #endif
-
   } 
   else if (microSteps==2) {
     doMotorStep8(step);
@@ -522,13 +527,14 @@ int calcMotorStep(int direction) {
   return(1);
 }
 
+// main motor control loop
 void interrup_t1() {
   int diff = 0;
 
   if (!interrupting_t1) {
     interrupting_t1 = true;
 
-    if ( delay_tick == 0 || priomotion ) {  // tick es cero o movimiento prioritario
+    if ( delay_tick == 0 || priomotion ) {  // delay tick es cero o movimiento prioritario
       delay_tick =  SPEED_MAX/motion_speed - 1;  // velocidad 8x => no espera (11111111) ; velocidad 2x => espera 3 (10001000)
       diff = targetPos - motorPos; // calcula ticks (pasos) pendientes
       if ( diff ) {  // si hay pasos pendientes, mueve el motor
@@ -567,6 +573,7 @@ void interrup_t1() {
           else if (cmdInputMode == robofocus_mode) {
             sprintf(response_str,"FD0%05u", motorPos);  // devuelve posicion una vez completado movimiento
             robofocusResponse(response_str);
+            saveEEStatus(); // When the movement is completed, the new position is update to eeprom (bad)
           }
         }
       }
@@ -579,8 +586,10 @@ void interrup_t1() {
     if ( relax_ticks > 0 ) { // si estoy esperando relajacion, comienza la cuenta atras ...
       relax_ticks--;
       if ( relax_ticks == 0 ) {
-        //Serial.print("RELAJANDO\n"); 
-        relaja_motor();
+#ifdef _FOCUSER_MOTOR_DEBUG
+        Serial.print("Relaxing motor\n"); 
+#endif
+        motorRelax();
       }
     }
     else
@@ -647,16 +656,6 @@ void robofocusResponse(char *rbfcmd)
     Serial.write((byte)rbfcmd[i]);
 
   Serial.write((byte)(roboFocusCalculateSum(rbfcmd)));
-
-  switch( rbfcmd[0] ) {
-  case 'D':
-  case 'S':
-  case 'L':
-  case 'B':
-  case 'M':
-    saveEEStatus(); // write eeprom
-    break;
-  }
 }
 
 void respondeRobococusVersion( char *version )
@@ -816,15 +815,15 @@ void printDebugging() {
   sprintf( tmp_str, "VERSION: v%s\r\n", VERSION);
   Serial.print(tmp_str);
 
-  sprintf( tmp_str, "targetPos,motorPos,limit,bslash,backslash_dir\tmicroSteps,timer1Period\r\n");
+  sprintf( tmp_str, "targetPos,motorPos,limit \tbslash,backslash_dir \tmicroSteps,timer1Period\r\n");
   Serial.print(tmp_str);
-  sprintf( tmp_str, "%05u,%05u,%05u\t%u,\t%d,\t%d,\t%d\r\n",
+  sprintf( tmp_str, "%05u,%05u,%05u \t%u,%c \t%d,%d\r\n",
   targetPos, motorPos, limit, backslash, backslash_dir, microSteps ,timer1Period);
   Serial.print(tmp_str);
 
-  sprintf( tmp_str, "TEMP,HUM,DEWP\tTEMPA,TEMPB,TEMPC\tTEMPVA,TEMPVB,TEMPVC\tPWMA,PWMB,PWMC\r\n");
+  sprintf( tmp_str, "TEMP,HUM,DEWP \tTEMPA,TEMPB,TEMPC \tTEMPVA,TEMPVB,TEMPVC \tPWMA,PWMB,PWMC\r\n");
   Serial.print(tmp_str);
-  sprintf( tmp_str, "%d,\t%d,\t%d,  \t%d,\t%d,\t%d,  \t%d,\t%d,\t%d,  \t%d,\t%d,\t%d\r\n",
+  sprintf( tmp_str, "%d,\t%d,\t%d  \t%d,\t%d,\t%d  \t%d,\t%d,\t%d \t%d,\t%d,\t%d\r\n",
   (int)(temperature*10), (int)(humidity*10), (int)(dewPointValue*10),
   (int)(lastSensorATemp*10), (int)(lastSensorBTemp*10), (int)(lastSensorCTemp*10),
   lastSensorATemp_Value, lastSensorBTemp_Value, lastSensorCTemp_Value,
@@ -875,13 +874,17 @@ boolean processRobofocusCommand (char * command) {
     break;
 
   case 'S':          // set position without motion
-    if (sscanf(command,"FS0%5u",&v) == 1 )
+    if (sscanf(command,"FS0%5u",&v) == 1 ) {
       setPosition(v);
+      saveEEStatus(); // write eeprom
+    }
     break;
 
   case 'L':          // set limits FL000000#
-    if (sscanf(command,"FL0%5u",&v) == 1 )
+    if (sscanf(command,"FL0%5u",&v) == 1 ) {
       setLimit(v);
+      saveEEStatus(); // write eeprom
+    }
     break;
 
   case 'B':          // req backlash info FB000000#
@@ -889,7 +892,7 @@ boolean processRobofocusCommand (char * command) {
       if ( d != 0) {
         backslash_dir = d;
         backslash = v;
-        saveEEStatus();
+        saveEEStatus(); // write eeprom
       } 
       sprintf(response_str,"FB%c%05u", backslash_dir+'0', backslash);
       robofocusResponse(response_str);
@@ -905,7 +908,7 @@ boolean processRobofocusCommand (char * command) {
       } 
     break;
 
-  case 'C':          // confuguracion
+  case 'C':          // configuracion
     sprintf(response_str,"FC%c%c%c000",0xff,0,1); // FC|(byte)dutty,(byte)delay,(byte)ticks|000
     robofocusResponse(response_str);
     break;
@@ -949,7 +952,6 @@ boolean processRobofocusCommand (char * command) {
         microSteps = 1<<steps;
         timer1Period = v;
         Timer1.setPeriod(timer1Period);
-        saveEEStatus();
       }
       steps=0;
       byte microSteps2;
@@ -959,6 +961,7 @@ boolean processRobofocusCommand (char * command) {
 
       sprintf(response_str,"FM%1u%05u", steps, timer1Period); 
       robofocusResponse(response_str);
+      saveEEStatus(); // write eeprom
 
       // FM500500#
       // steps: 5
@@ -988,7 +991,7 @@ boolean processRobofocusCommand (char * command) {
       switch( command[3] ) {
       case 'A':
         if (sscanf(command,"FHWA0%3u",&v) == 1 ) {  // FHWA1000#
-          v = ( v < 100 ? v : 100 );
+          v = ( v < 64 ? v : 64 );
           heaterA = ( heaterA < 0 ? -v : v);
         }
         sprintf(response_str,"FHWA0%03u", heaterA);
@@ -996,7 +999,7 @@ boolean processRobofocusCommand (char * command) {
         break;
       case 'B':
         if (sscanf(command,"FHWB0%3u",&v) == 1 ) {  // FHWB1000# FHWB0100#
-          v = ( v < 100 ? v : 100 );
+          v = ( v < 64 ? v : 64 );
           heaterB = ( heaterB < 0 ? -v : v);
         }
         sprintf(response_str,"FHWB0%03u", heaterB);
@@ -1004,7 +1007,7 @@ boolean processRobofocusCommand (char * command) {
         break;
       case 'C':
         if (sscanf(command,"FHWC0%3u",&v) == 1 ) {  // FHWC0000#
-          v = ( v < 100 ? v : 100 );
+          v = ( v < 64 ? v : 64 );
           heaterC = ( heaterC < 0 ? -v : v);
         }
         sprintf(response_str,"FHWC0%03u", heaterC);
@@ -1044,6 +1047,7 @@ boolean processRobofocusCommand (char * command) {
 
 }
 
+// prototipe commands
 boolean processJosluCommand (String command) {
   String param = command.substring(2);
   String param1;
@@ -1054,8 +1058,8 @@ boolean processJosluCommand (String command) {
     param1 = param.substring(0,isep-1); 
     param2 = param.substring(isep);
   }
-
   // JB300:4600
+
   switch( command.charAt(1) ) {
   case 'O': // move outward
     moveIn(param.toInt());
@@ -1125,7 +1129,7 @@ cmdInputModeType processSerialCommand(String command) {
 
   cmdInputModeType result = unknownserialinput_mode;
   char rbfCommand[10] = {
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00                                                                 };
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00                                                                                   };
 
   switch(command.charAt(0)) {
   case 'F':
@@ -1150,7 +1154,6 @@ cmdInputModeType processSerialCommand(String command) {
   }
   return(result); 
 }
-
 
 
 //--------------------------------------------------------------------------------------------------------
@@ -1224,7 +1227,7 @@ void setup() {
 }
 
 
-// Interrupt serial event
+// Serial event loop
 void serialEvent() {
 
   while (Serial.available() > 0) {
@@ -1255,16 +1258,28 @@ void serialEvent() {
         serialInputCount = 0;
         if (!cmdInputMode)
           cmdInputMode = robofocus_mode;
+
       } 
+      else if ((inChar == 'J') && (cmdInputMode == robofocus_mode)) { // sync robofocus mode
+        serialInputString = "J";
+        serialInputCount = 1;
+      }
     }
   }
 }
 
+// Software PWM loop (low frequency)
+void pwmHeaterLoop() {
+  // heaterX < 0 => always LOW
+  digitalWrite(HEATER_A_PIN, heaterA > pwmHeatersCounter ? HIGH : LOW); 
+  digitalWrite(HEATER_B_PIN, heaterB > pwmHeatersCounter ? HIGH : LOW);
+  digitalWrite(HEATER_C_PIN, heaterC > pwmHeatersCounter ? HIGH : LOW);
+  pwmHeatersCounter < 64 ? pwmHeatersCounter++ : pwmHeatersCounter=0;
+}
 
+// main loop
 void loop() {
   unsigned long currentTime = millis();
-
-  serialEvent(); // Arduino Micro, Esplora or Leonardo
 
   // DO every 5 seconds (cada 2 x 2500ms)
   if ( currentTime / 2500 % 2)  {
@@ -1313,7 +1328,7 @@ void loop() {
        heaterA = 0;
        if (temperature > dewPointValue) {
        heaterB = 50;
-       heaterC = 100;
+       heaterC = 64;
        } 
        else {
        heaterB = 0;
@@ -1322,7 +1337,7 @@ void loop() {
        
        //heaterA = 25;
        //heaterB = 50;
-       //heaterC = 100;
+       //heaterC = 64;
        */
 
       // Cable disconnected
@@ -1333,7 +1348,6 @@ void loop() {
       if (lastSensorCTemp_Value == NAN )
         heaterC = -abs(heaterC);
 
-
       //Serial.println(currentTime);
       loop_halfsecond_ready = false;
     }
@@ -1341,16 +1355,21 @@ void loop() {
   else
     loop_halfsecond_ready = true;
 
-  // Soft PWM loop
-  // heaterX < 0 => always LOW
-  digitalWrite(HEATER_A_PIN, heaterA > pwmCounter ? HIGH : LOW); 
-  digitalWrite(HEATER_B_PIN, heaterB > pwmCounter ? HIGH : LOW);
-  digitalWrite(HEATER_C_PIN, heaterC > pwmCounter ? HIGH : LOW);
-  pwmCounter < 100 ? pwmCounter++ : pwmCounter=0;
-  // end Soft PWM loop
+  // Other periodic tasks
+  serialEvent();    // serial control loop. Arduino Micro, Esplora or Leonardo
+  pwmHeaterLoop();  // PWM heaters control loop
 
-  delay(10);
+    delay(10);
 }
+
+
+
+
+
+
+
+
+
 
 
 
