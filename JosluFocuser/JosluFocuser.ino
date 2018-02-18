@@ -59,7 +59,7 @@
 #include <DHT.h>      // http://playground.arduino.cc/Main/DHTLib
 #include "JosluFocuser.h"
 
-#define VERSION "13"
+#define VERSION "14"
 #define ROBOFOCUS_VERSION "000111" //don't change
 
 //#define DHT_TYPE DHT22   // AM2302
