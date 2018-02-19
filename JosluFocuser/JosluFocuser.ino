@@ -328,7 +328,7 @@ void writeEE()
 {
   byte *v;
   v = (byte *) &mieeprom;
-  for (unsigned int i=0; i < sizeof(mieeprom);i++,v++) {
+  for (int i=0; i < sizeof(mieeprom);i++,v++) {
     if( EEPROM.read(i) != *v ) // to save eeprom life
       EEPROM.write(i, *v);
     //EEPROM.update(i,*v);
