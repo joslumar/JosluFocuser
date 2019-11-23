@@ -59,7 +59,7 @@
 #include <DHT.h>      // http://playground.arduino.cc/Main/DHTLib
 #include "JosluFocuser.h"
 
-#define VERSION "14"
+#define VERSION "15"
 #define ROBOFOCUS_VERSION "000111" //don't change
 
 //#define DHT_TYPE DHT22   // AM2302
@@ -501,10 +501,8 @@ void doMotorStep(int step)
   }
 }
 
-int calcMotorStep(int direction) {
-  int rc=0;
-
-  if ( direction ) {
+int calcMotorStep(int sentido) {
+  if ( sentido ) {
     if ( step < (microSteps<<2) - 1 )
       step++;
     else
@@ -1185,10 +1183,10 @@ void setup() {
   //TCCR4B = TCCR4B & B11111000 | B001; // timer4 prescaler = 1 f: 31372.55 Hz 8bit phase-correct hardware pwm
   //TCCR0B = TCCR0B & B11111000 | B011; // prescaler = 64 (default) f: 976.5625 Hz fast pwm
 
-  TCCR0A = TCCR0A & B11111000 | B001; // timer0 setup 8bit phase-correct hardware pwm
-  TCCR0B = TCCR0B & B11111000 | TIMERPRESCALER0_VALUE;
-  TCCR3B = TCCR3B & B11111000 | TIMERPRESCALER0_VALUE;
-  TCCR4B = TCCR4B & B11111000 | TIMERPRESCALER4_VALUE;
+  TCCR0A = ( TCCR0A & B11111000 ) | B001; // timer0 setup 8bit phase-correct hardware pwm
+  TCCR0B = ( TCCR0B & B11111000 ) | TIMERPRESCALER0_VALUE;
+  TCCR3B = ( TCCR3B & B11111000 ) | TIMERPRESCALER0_VALUE;
+  TCCR4B = ( TCCR4B & B11111000 ) | TIMERPRESCALER4_VALUE;
 
   pinMode(HEATER_A_PIN, OUTPUT);
   pinMode(HEATER_B_PIN, OUTPUT);
